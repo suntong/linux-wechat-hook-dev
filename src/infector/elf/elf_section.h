@@ -1,6 +1,7 @@
 #ifndef ELF_SECTION_H_
 #define ELF_SECTION_H_
 
+#include <cstdint>
 #include <list>
 #include <iostream>
 #include <map>
