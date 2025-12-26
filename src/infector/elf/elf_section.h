@@ -5,6 +5,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <cstdint>
 #include <elf.h>
 
 typedef struct {
