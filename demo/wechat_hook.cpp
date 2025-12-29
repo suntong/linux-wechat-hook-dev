@@ -1,292 +1,208 @@
 #include <iostream>
+#include <cstdio>
+#include <cstring>
 #include <unistd.h>
-#include <string.h>
-#include <sys/user.h>
+#include <sys/mman.h>
+#include <elf.h>
 
+#include "hook.h"
 #include "target/targetopt.h"
 #include "log/log.h"
-#include <sys/mman.h>
-//#define WECHAT_OFFSET 0x96df18
+
 #define WECHAT_OFFSET 0x9b0a7a
-//0x9b0a7a
-void __attribute__((constructor)) wechat_hook_init(void) {
-    printf("Dynamic library loaded: Running initialization.\n");
+#define NOP_PATTERN_SIZE 16
+
+/*
+ * Validate pointer is in user space range
+ */
+static inline bool is_valid_user_ptr(uint64_t addr)
+{
+    return (addr >= 0x10000 && addr < 0x7fffffffffff);
+}
+
+/*
+ * Hook core function - receives pointer to saved registers
+ * This is called from assembly: wechat_hook_core(&regs)
+ */
+extern "C" void wechat_hook_core(struct hook_regs *regs)
+{
+    /*
+     * Access register values - these are the EXACT values
+     * that were in the CPU registers when WeChat hit the hook point
+     */
+
+    if (is_valid_user_ptr(regs->rdi)) {
+        LOGGER_INFO << " rdi  " << LogFormat::addr << regs->rdi
+                    << "  " << (char *)regs->rdi;
+    }
+
+    /*
+     * You can examine other registers too:
+     */
+    #if 0
+    if (is_valid_user_ptr(regs->rsi)) {
+        LOGGER_INFO << " rsi  " << LogFormat::addr << regs->rsi 
+                    << "  " << (char *)regs->rsi;
+    }
+    if (is_valid_user_ptr(regs->rdx)) {
+        LOGGER_INFO << " rdx  " << LogFormat::addr << regs->rdx;
+    }
+    if (is_valid_user_ptr(regs->rcx)) {
+        LOGGER_INFO << " rcx  " << LogFormat::addr << regs->rcx;
+    }
+    if (is_valid_user_ptr(regs->r8)) {
+        LOGGER_INFO << " r8   " << LogFormat::addr << regs->r8;
+    }
+    if (is_valid_user_ptr(regs->r9)) {
+        LOGGER_INFO << " r9   " << LogFormat::addr << regs->r9;
+    }
+    #endif
+
+    /*
+     * You can also MODIFY registers!
+     * Changes here will be restored to actual CPU registers
+     * when returning to WeChat.
+     * 
+     * Example: Change return value
+     *   regs->rax = 0;
+     * 
+     * Example: Modify first argument
+     *   regs->rdi = (uint64_t)my_fake_string;
+     */
+}
+
+/*
+ * Library initialization - called when libX.so is loaded
+ */
+void __attribute__((constructor)) wechat_hook_init(void)
+{
+    printf("==============================================\n");
+    printf("libX.so loaded - Installing WeChat hook\n");
+    printf("==============================================\n");
+
     lmc::Logger::setLevel(LogLevel::all);
+
     TargetMaps target(getpid());
     Elf64_Addr wechat_baseaddr = 0;
     Elf64_Addr libx_baseaddr = 0;
     Elf64_Addr first_nop_cmd_addr = 0;
     Elf64_Addr second_nop_cmd_addr = 0;
-    if (target.readTargetAllMaps())
-    {
-        auto &maps = target.getMapInfo();
-        for (auto &m : maps)
-        {
-            if (m.first.find("wechat") != std::string::npos)
-            {
-                wechat_baseaddr = m.second;
-                LOGGER_INFO << m.first << " :: " << LogFormat::addr << m.second;
-            }
 
-            if (m.first.find("libX.so") != std::string::npos)
-            {
-                libx_baseaddr = m.second;
-                LOGGER_INFO << m.first << " :: " << LogFormat::addr << m.second;
-            } 
+    if (!target.readTargetAllMaps()) {
+        LOGGER_ERROR << "Failed to read target maps";
+        return;
+    }
+
+    /* Find base addresses */
+    auto &maps = target.getMapInfo();
+    for (auto &m : maps) {
+        if (m.first.find("wechat") != std::string::npos && wechat_baseaddr == 0) {
+            wechat_baseaddr = m.second;
+            LOGGER_INFO << m.first << " :: " << LogFormat::addr << m.second;
         }
-
-        unsigned char buffer[16] = {0x90};
-        memset(buffer, 0x90, sizeof(buffer));
-
-        unsigned char *nop_cmd_byte = (unsigned char *)libx_baseaddr;
-        for (int i = 0; i < 0x1000000; i++)
-        {
-            if (!memcmp(&nop_cmd_byte[i], buffer, sizeof(buffer)))
-            {
-                if (first_nop_cmd_addr)
-                {
-                    second_nop_cmd_addr = (Elf64_Addr)&nop_cmd_byte[i];
-                    LOGGER_INFO << "second search successful   " << LogFormat::addr << second_nop_cmd_addr;
-                    break;
-                } else {
-                    first_nop_cmd_addr = (Elf64_Addr)&nop_cmd_byte[i];
-                    LOGGER_INFO << "first search successful   " << LogFormat::addr << first_nop_cmd_addr;
-                    i += 16;
-                    continue;
-                }
-            }
-        }
-
-        if (mprotect((void *)(wechat_baseaddr), 0x1000000, PROT_WRITE | PROT_READ | PROT_EXEC) < 0)
-        {
-            
-        }
-
-        if (mprotect((void *)(libx_baseaddr), 0x10000, PROT_WRITE | PROT_READ | PROT_EXEC) < 0)
-        {
-            
-        }
-        
-        memcpy((unsigned char *)second_nop_cmd_addr, (unsigned char *)wechat_baseaddr + WECHAT_OFFSET, 12);
-
-        unsigned char movabs_wechat_buffer[10];
-        memset(movabs_wechat_buffer, 0, sizeof(movabs_wechat_buffer));
-        Elf64_Addr wechat_hook_point_addr = (Elf64_Addr)wechat_baseaddr + WECHAT_OFFSET + 12;
-        movabs_wechat_buffer[0] = 0x48;
-        movabs_wechat_buffer[1] = 0xb8;
-        memcpy(&movabs_wechat_buffer[2], &wechat_hook_point_addr, 8);
-        memcpy((unsigned char *)second_nop_cmd_addr + 12, movabs_wechat_buffer, 10);
-
-        unsigned char jmp_wechat_buffer[2];
-        jmp_wechat_buffer[0] = 0xff;
-        jmp_wechat_buffer[1] = 0xe0;
-        memcpy((unsigned char *)second_nop_cmd_addr + 22, jmp_wechat_buffer, 2);
-
-        unsigned char movabs_buffer[10];
-        memset(movabs_buffer, 0, sizeof(movabs_buffer));
-        movabs_buffer[0] = 0x48;
-        movabs_buffer[1] = 0xb8;
-        memcpy(&movabs_buffer[2], &first_nop_cmd_addr, 8);
-        memcpy((unsigned char *)wechat_baseaddr + WECHAT_OFFSET, movabs_buffer, 10);
-  
-        unsigned char jmp_buffer[2];
-        jmp_buffer[0] = 0xff;
-        jmp_buffer[1] = 0xe0;
-        memcpy((unsigned char *)wechat_baseaddr + WECHAT_OFFSET + 10, jmp_buffer, 2);
-
-        if (mprotect((void *)(wechat_baseaddr), 0x1000000, PROT_READ | PROT_EXEC) < 0)
-        {
-            
-        }
-
-        if (mprotect((void *)(libx_baseaddr), 0x10000, PROT_READ | PROT_EXEC) < 0)
-        {
-            
+        if (m.first.find("libX.so") != std::string::npos && libx_baseaddr == 0) {
+            libx_baseaddr = m.second;
+            LOGGER_INFO << m.first << " :: " << LogFormat::addr << m.second;
         }
     }
-}
 
-static void wechat_hook_core(struct user_regs_struct *regs)
-{
-    // if (regs->r8 > 0x5016f3e7d290 && regs->r8 < 0x7fffffffffff)
-    // {
-    //     LOGGER_INFO << " r8  " << LogFormat::addr << regs->r8 << "  " << (char *)regs->r8;
-    // }
-    // if (regs->r9 > 0x5016f3e7d290 && regs->r9 < 0x7fffffffffff)
-    // {
-    //     LOGGER_INFO << " r9  " << LogFormat::addr << regs->r9 << "  " << (char *)regs->r9;
-    // }
-    // if (regs->r10 > 0x5016f3e7d290 && regs->r10 < 0x7fffffffffff)
-    // {
-    //     LOGGER_INFO << " r10  " << LogFormat::addr << regs->r10 << "  " << (char *)regs->r10;
-    // }
-    // if (regs->r11 > 0x5016f3e7d290 && regs->r11 < 0x7fffffffffff)
-    // {
-    //     LOGGER_INFO << " r11  " << LogFormat::addr << regs->r11 << "  " << (char *)regs->r11;
-    // }
-    // if (regs->r12 > 0x5016f3e7d290 && regs->r12 < 0x7fffffffffff)
-    // {
-    //     LOGGER_INFO << " r12  " << LogFormat::addr << regs->r12 << "  " << (char *)regs->r12;
-    // }
-    // if (regs->r13 > 0x5016f3e7d290 && regs->r13 < 0x7fffffffffff)
-    // {
-    //     LOGGER_INFO << " r13  " << LogFormat::addr << regs->r13 << "  " << (char *)regs->r13;
-    // }
-    // if (regs->rsi > 0x5016f3e7d290 && regs->rsi < 0x7fffffffffff)
-    // {
-    //     LOGGER_INFO << " rsi  " << LogFormat::addr << regs->rsi << "  " << (char *)regs->rsi;
-    // }
-    if (regs->rdi > 0x5016f3e7d290 && regs->rdi < 0x7fffffffffff)
-    {
-        LOGGER_INFO << " rdi  " << LogFormat::addr << regs->rdi << "  " << (char *)regs->rdi;
+    if (!wechat_baseaddr || !libx_baseaddr) {
+        LOGGER_ERROR << "Failed to find base addresses";
+        return;
     }
-    // if (regs->rsp > 0x5016f3e7d290 && regs->rsp < 0x7fffffffffff)
-    // {
-    //     LOGGER_INFO << " rsp  " << LogFormat::addr << regs->rsp << "  " << (char *)regs->rsp;
-    // }
-    // if (regs->rbp > 0x5016f3e7d290 && regs->rbp < 0x7fffffffffff)
-    // {
-    //     LOGGER_INFO << " rbp  " << LogFormat::addr << regs->rbp << "  " << (char *)regs->rbp;
-    // }
-}
 
-static void wechat_hook_run()
-{
-    // asm("push %rax;\n"
-    //     "push %rbx;\n"
-    //     "push %rcx;\n"
-    //     "push %rdx;\n"
-    //     "push %rsi;\n"
-    //     "push %rdi;\n"
-    //     "push %r8;\n"
-    //     "push %r9;\n"
-    //     "push %r10;\n"
-    //     "push %r11;\n"
-    //     "push %r12;\n"
-    //     "push %r13;\n"
-    //     "push %r14;\n"
-    //     "push %r15;\n"
-    //     "push %rbp;\n"
-    //     "push %rsp;\n"
-    // );
-    struct user_regs_struct regs = {0};
-    // asm("pop %rsp;\n"
-    //     "pop %rbp;\n"
-    //     "pop %r15;\n"
-    //     "pop %r14;\n"
-    //     "pop %r13;\n"
-    //     "pop %r12;\n"
-    //     "pop %r11;\n"
-    //     "pop %r10;\n"
-    //     "pop %r9;\n"
-    //     "pop %r8;\n"
-    //     "pop %rdi;\n"
-    //     "pop %rsi;\n"
-    //     "pop %rdx;\n"
-    //     "pop %rcx;\n"
-    //     "pop %rbx;\n"
-    //     "pop %rax;\n"
-    // );
-    asm volatile (
-        "mov %%rbx, %0\n"
-        "mov %%rcx, %1\n"
-        "mov %%rdx, %2\n"
-        "mov %%rsi, %3\n"
-        "mov %%r15, %4\n"
-        "mov %%r14, %5\n"
-        "mov %%rsp, %6\n"
-        "mov %%r8, %7\n"
-        "mov %%r9, %8\n"
-        "mov %%r10, %9\n"
-        "mov %%r11, %10\n"
-        "mov %%r12, %11\n"
-        "mov %%r13, %12\n"
-        "mov %%r14, %13\n"
-        "mov %%r15, %14\n"
-        : "=m"(regs.rbx), "=m"(regs.rcx), "=m"(regs.rdx),
-          "=m"(regs.rsi), "=m"(regs.rdi), "=m"(regs.rbp), "=m"(regs.rsp),
-          "=m"(regs.r8), "=m"(regs.r9), "=m"(regs.r10), "=m"(regs.r11),
-          "=m"(regs.r12), "=m"(regs.r13), "=m"(regs.r14), "=m"(regs.r15)
-        :
-        : "memory"
-    );
-    wechat_hook_core(&regs);
-    asm volatile (
-        "mov %0, %%rbx\n"
-        "mov %1, %%rcx\n"
-        "mov %2, %%rdx\n"
-        "mov %3, %%rsi\n"
-        "mov %4, %%rdi\n"
-        "mov %5, %%r8\n"
-        "mov %6, %%r9\n"
-        "mov %7, %%r10\n"
-        "mov %8, %%r11\n"
-        "mov %9, %%r12\n"
-        "mov %10, %%r13\n"
-        "mov %11, %%r14\n"
-        "mov %12, %%r15\n"
-        :
-        : "m"(regs.rbx), "m"(regs.rcx), "m"(regs.rdx),
-          "m"(regs.rsi), "m"(regs.rdi), "m"(regs.r8), 
-          "m"(regs.r9), "m"(regs.r10), "m"(regs.r11),
-          "m"(regs.r12), "m"(regs.r13), "m"(regs.r14), "m"(regs.r15)
-        : "memory"
-    );
-}
+    /* Search for NOP sleds in our library */
+    unsigned char nop_pattern[NOP_PATTERN_SIZE];
+    memset(nop_pattern, 0x90, sizeof(nop_pattern));
 
-void wechat_hook()
-{
-    asm("nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "mov %rbp,%r14;\n"
-        "mov %rdi,%r15;\n"
-    );
-   
-   // printf("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    wechat_hook_run();
-    asm("nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-        "nop;\n"
-    );
+    unsigned char *search_ptr = (unsigned char *)libx_baseaddr;
+    for (int i = 0; i < 0x1000000; i++) {
+        if (memcmp(&search_ptr[i], nop_pattern, sizeof(nop_pattern)) == 0) {
+            if (first_nop_cmd_addr) {
+                second_nop_cmd_addr = (Elf64_Addr)&search_ptr[i];
+                LOGGER_INFO << "second NOP sled @ " << LogFormat::addr << second_nop_cmd_addr;
+                break;
+            } else {
+                first_nop_cmd_addr = (Elf64_Addr)&search_ptr[i];
+                LOGGER_INFO << "first NOP sled @ " << LogFormat::addr << first_nop_cmd_addr;
+                i += NOP_PATTERN_SIZE;  /* Skip past this sled */
+            }
+        }
+    }
+
+    if (!first_nop_cmd_addr || !second_nop_cmd_addr) {
+        LOGGER_ERROR << "Failed to find NOP sleds in libX.so";
+        return;
+    }
+
+    /* Make memory writable for patching */
+    size_t page_size = sysconf(_SC_PAGESIZE);
+    Elf64_Addr wechat_page = wechat_baseaddr & ~(page_size - 1);
+    Elf64_Addr libx_page = libx_baseaddr & ~(page_size - 1);
+
+    if (mprotect((void *)wechat_page, 0x1000000, PROT_WRITE | PROT_READ | PROT_EXEC) < 0) {
+        LOGGER_ERROR << "mprotect failed for WeChat region";
+        return;
+    }
+
+    if (mprotect((void *)libx_page, 0x100000, PROT_WRITE | PROT_READ | PROT_EXEC) < 0) {
+        LOGGER_ERROR << "mprotect failed for libX region";
+        return;
+    }
+
+    /*
+     * =================================================================
+     * PATCH 1: Exit trampoline (second_nop_cmd_addr)
+     * 
+     * Layout (24 bytes total):
+     *   [0-11]  Original 12 bytes from WeChat @ 0x9b0a7a
+     *   [12-21] movabs rax, return_addr
+     *   [22-23] jmp rax
+     * =================================================================
+     */
+    unsigned char *exit_patch = (unsigned char *)second_nop_cmd_addr;
+    
+    /* Copy original 12 bytes that we're about to overwrite */
+    memcpy(exit_patch, (unsigned char *)wechat_baseaddr + WECHAT_OFFSET, 12);
+    
+    /* movabs rax, imm64 (return address = hook point + 12) */
+    Elf64_Addr return_addr = wechat_baseaddr + WECHAT_OFFSET + 12;
+    exit_patch[12] = 0x48;  /* REX.W */
+    exit_patch[13] = 0xB8;  /* MOV RAX, imm64 */
+    memcpy(&exit_patch[14], &return_addr, 8);
+    
+    /* jmp rax */
+    exit_patch[22] = 0xFF;
+    exit_patch[23] = 0xE0;
+
+    /*
+     * =================================================================
+     * PATCH 2: WeChat hook point (wechat_baseaddr + WECHAT_OFFSET)
+     * 
+     * Layout (12 bytes total):
+     *   [0-9]   movabs rax, first_nop_cmd_addr
+     *   [10-11] jmp rax
+     * =================================================================
+     */
+    unsigned char *hook_patch = (unsigned char *)wechat_baseaddr + WECHAT_OFFSET;
+    
+    /* movabs rax, imm64 (our hook entry point) */
+    hook_patch[0] = 0x48;   /* REX.W */
+    hook_patch[1] = 0xB8;   /* MOV RAX, imm64 */
+    memcpy(&hook_patch[2], &first_nop_cmd_addr, 8);
+    
+    /* jmp rax */
+    hook_patch[10] = 0xFF;
+    hook_patch[11] = 0xE0;
+
+    /* Restore memory protection */
+    mprotect((void *)wechat_page, 0x1000000, PROT_READ | PROT_EXEC);
+    mprotect((void *)libx_page, 0x100000, PROT_READ | PROT_EXEC);
+
+    LOGGER_INFO << "==============================================";
+    LOGGER_INFO << "Hook installed successfully!";
+    LOGGER_INFO << "  Hook point: " << LogFormat::addr << (wechat_baseaddr + WECHAT_OFFSET);
+    LOGGER_INFO << "  Entry sled: " << LogFormat::addr << first_nop_cmd_addr;
+    LOGGER_INFO << "  Exit sled:  " << LogFormat::addr << second_nop_cmd_addr;
+    LOGGER_INFO << "==============================================";
 }
