@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -std=gnu++11 -g -shared -Wl,-soname,libinject.so -o libinject.so CMakeFiles/inject.dir/eviluser.cpp.o CMakeFiles/inject.dir/inject.cpp.o   -L/app/base_build/install/lib  -Wl,-rpath,/app/base_build/install/lib -Wl,--whole-archive ../target/libtarget.a -lpthread -Wl,--no-whole-archive -llmcbase

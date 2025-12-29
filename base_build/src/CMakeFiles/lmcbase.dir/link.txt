@@ -1,0 +1,2 @@
+/usr/bin/ar qc liblmcbase.a CMakeFiles/lmcbase.dir/threadpool/lthread.cpp.o CMakeFiles/lmcbase.dir/threadpool/workqueue.cpp.o CMakeFiles/lmcbase.dir/timer/ltimer.cpp.o CMakeFiles/lmcbase.dir/cmdline/cmdline.cpp.o CMakeFiles/lmcbase.dir/log/log.cpp.o
+/usr/bin/ranlib liblmcbase.a

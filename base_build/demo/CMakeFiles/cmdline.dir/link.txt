@@ -1,0 +1,1 @@
+/usr/bin/c++ -std=gnu++11 -g -rdynamic CMakeFiles/cmdline.dir/cmdline.cpp.o -o cmdline  ../src/liblmcbase.a -lpthread

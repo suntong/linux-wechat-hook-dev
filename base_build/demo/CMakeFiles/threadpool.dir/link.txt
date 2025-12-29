@@ -1,0 +1,1 @@
+/usr/bin/c++ -std=gnu++11 -g -rdynamic CMakeFiles/threadpool.dir/threadpool.cpp.o -o threadpool  ../src/liblmcbase.a -lpthread

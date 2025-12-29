@@ -1,0 +1,2 @@
+/usr/bin/ar qc libinfector.a CMakeFiles/infector.dir/editso.cpp.o CMakeFiles/infector.dir/elf/elf_dynamic.cpp.o CMakeFiles/infector.dir/elf/elf_dynsym.cpp.o CMakeFiles/infector.dir/elf/elf_gnuver_r.cpp.o CMakeFiles/infector.dir/elf/elf_reladyn.cpp.o CMakeFiles/infector.dir/elf/elf_section.cpp.o CMakeFiles/infector.dir/elf/elfopt.cpp.o CMakeFiles/infector.dir/infector.cpp.o
+/usr/bin/ranlib libinfector.a

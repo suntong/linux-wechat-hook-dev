@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -std=gnu++11 -g -shared -Wl,-soname,libX.so -o libX.so CMakeFiles/X.dir/wechat_hook.cpp.o   -L/app/base_build/install/lib  -Wl,-rpath,/app/base_build/install/lib -llmcbase ../src/target/libtarget.a -llmcbase

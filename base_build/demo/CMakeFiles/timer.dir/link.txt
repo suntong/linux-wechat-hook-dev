@@ -1,0 +1,1 @@
+/usr/bin/c++ -std=gnu++11 -g -rdynamic CMakeFiles/timer.dir/timer.cpp.o -o timer  ../src/liblmcbase.a -lpthread
