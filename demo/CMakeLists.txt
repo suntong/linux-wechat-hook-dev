@@ -16,9 +16,10 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -O2 -fPIC -fno-omit-frame-pointer"
 # Create shared library
 add_library(X SHARED ${WECHAT_HOOK_FILES})
 
-# Link libraries
+# Link libraries (dl for dl_iterate_phdr)
 target_link_libraries(X lmcbase)
 target_link_libraries(X target)
+target_link_libraries(X dl)
 
 #add_executable(virus ${VIRUS_FILES})
 #target_link_libraries(virus lmcbase)

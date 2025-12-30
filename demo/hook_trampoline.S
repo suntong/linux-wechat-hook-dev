@@ -44,21 +44,21 @@ wechat_hook:
     # SAVE ORIGINAL RSP IMMEDIATELY
     # Must do this FIRST before any stack operations
     # Use r11 temporarily (caller-saved, will be saved to struct later)
+    # NOTE: mov does NOT modify flags
     #========================================================================
     mov r11, rsp
 
     #========================================================================
-    # HANDLE RED ZONE
+    # HANDLE RED ZONE + ALLOCATE REGISTER STRUCT
     # x86-64 SysV ABI: 128 bytes below RSP may contain WeChat's data
     # We must not corrupt this area
+    #
+    # CRITICAL: Use lea instead of sub!
+    # sub modifies flags (ZF, SF, CF, OF, etc.), but we need to preserve
+    # the original flags from WeChat for the exit trampoline's je instruction.
+    # lea does NOT modify flags.
     #========================================================================
-    sub rsp, 128
-
-    #========================================================================
-    # ALLOCATE REGISTER STRUCT ON STACK
-    # Equivalent to: struct hook_regs regs;
-    #========================================================================
-    sub rsp, REG_STRUCT_SIZE
+    lea rsp, [rsp - 128 - REG_STRUCT_SIZE]
 
     #========================================================================
     # SAVE ALL REGISTERS TO STRUCT
@@ -86,7 +86,11 @@ wechat_hook:
     mov [rsp + REG_R14], r14
     mov [rsp + REG_R15], r15
 
-    # Save RFLAGS (condition flags)
+    #========================================================================
+    # SAVE RFLAGS
+    # Now we save the ORIGINAL flags from WeChat, since we used lea
+    # (which doesn't modify flags) instead of sub.
+    #========================================================================
     pushfq
     pop rax
     mov [rsp + REG_RFLAGS], rax
