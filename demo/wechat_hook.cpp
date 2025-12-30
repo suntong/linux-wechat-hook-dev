@@ -1,4 +1,5 @@
 #include <iostream>
+#include <stdint.h>
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
@@ -154,7 +155,7 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
 
   // Only need to make writable the specific regions we're patching
   // 12 bytes at WeChat hook point
-  // ~30 bytes at each NOP sled
+  // ~64 bytes at exit sled
 
   if (mprotect_page(wechat_hook_addr, 12, PROT_WRITE | PROT_READ | PROT_EXEC)
       < 0) {
@@ -178,27 +179,70 @@ void __attribute__ ((constructor)) wechat_hook_init(void) {
    * =================================================================
    * PATCH 1: Exit trampoline (second_nop_cmd_addr)
    * 
-   * Layout (24 bytes total):
-   *   [0-11]  Original 12 bytes from WeChat @ 0x9b0a7a
-   *   [12-21] movabs rax, return_addr
-   *   [22-23] jmp rax
+   * Original code at 0x9b0a7a (12 bytes):
+   *   74 05             je +5 (skip call if equal)
+   *   e8 XX XX XX XX    call rel32 (relative call to _ZdlPv@plt)
+   *   80 7c 24 10 00    cmpb $0x0, 0x10(%rsp)
+   *
+   * Problem: je and call use RIP-relative addressing, so we cannot
+   * just memcpy them - they would jump/call to wrong addresses.
+   *
+   * Solution: Rebuild with absolute addressing (31 bytes total):
+   *   74 0C             je +12 (skip the movabs+call = 10+2 bytes)
+   *   48 B8 [8 bytes]   movabs rax, <absolute call target>
+   *   FF D0             call rax
+   *   80 7C 24 10 00    cmpb $0x0, 0x10(%rsp) (safe, no relocation)
+   *   48 B8 [8 bytes]   movabs rax, <return address>
+   *   FF E0             jmp rax
+   *
+   * Why this works:
+   *   - je remains short and only skips the call in the trampoline
+   *   - The call is absolute and no longer depends on trampoline's RIP
+   *   - mov/call don't alter flags; RFLAGS restored earlier preserves
+   *     the cmp's flags for the je
+   *   - rax is caller-saved, and the original call clobbers it anyway
    * =================================================================
    */
   unsigned char *exit_patch = (unsigned char *) second_nop_cmd_addr;
+  unsigned char *orig = (unsigned char *) wechat_baseaddr + WECHAT_OFFSET;
 
-  /* Copy original 12 bytes that we're about to overwrite */
-  memcpy(exit_patch, (unsigned char *) wechat_baseaddr + WECHAT_OFFSET, 12);
+  /* Compute absolute target of original call at orig+2 (e8 rel32) */
+  int32_t rel32 = 0;
+  memcpy(&rel32, orig + 3, sizeof(rel32));                  /* imm32 right after 0xE8 */
+  Elf64_Addr call_site_end = (Elf64_Addr)(orig + 2 + 5);    /* orig+7 */
+  Elf64_Addr call_abs = (Elf64_Addr)((int64_t)call_site_end + (int64_t)rel32);
 
-  /* movabs rax, imm64 (return address = hook point + 12) */
-  Elf64_Addr return_addr = wechat_baseaddr + WECHAT_OFFSET + 12;
+  /* movabs rax, imm64 (return address = hook point + N) */
+  Elf64_Addr return_addr = wechat_baseaddr + WECHAT_OFFSET + 12; /* N = 12 here */
 
-  exit_patch[12] = 0x48;	/* REX.W */
-  exit_patch[13] = 0xB8;	/* MOV RAX, imm64 */
-  memcpy(&exit_patch[14], &return_addr, 8);
+  size_t off = 0;
+
+  /* je +12 */
+  exit_patch[off++] = 0x74;
+  exit_patch[off++] = 0x0C;
+
+  /* movabs rax, <abs target of original call> */
+  exit_patch[off++] = 0x48;  /* REX.W */
+  exit_patch[off++] = 0xB8;  /* MOV RAX, imm64 */
+  memcpy(exit_patch + off, &call_abs, 8); off += 8;
+
+  /* call rax */
+  exit_patch[off++] = 0xFF;
+  exit_patch[off++] = 0xD0;
+
+  /* cmpb 0x10(%rsp), $0x0 — copy original 5 bytes from orig+7 */
+  memcpy(exit_patch + off, orig + 7, 5); off += 5;
+
+  /* movabs rax, return_addr */
+  exit_patch[off++] = 0x48;  /* REX.W */
+  exit_patch[off++] = 0xB8;  /* MOV RAX, imm64 */
+  memcpy(exit_patch + off, &return_addr, 8); off += 8;
 
   /* jmp rax */
-  exit_patch[22] = 0xFF;
-  exit_patch[23] = 0xE0;
+  exit_patch[off++] = 0xFF;
+  exit_patch[off++] = 0xE0;
+
+  LOGGER_INFO << "Exit trampoline size: " << off << " bytes";
 
   /*
    * =================================================================

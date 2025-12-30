@@ -27,7 +27,7 @@
 # wechat_hook - Main hook entry point
 #============================================================================
 .global wechat_hook          # Entry point (16 NOPs)
-.global wechat_hook_resume   # Exit point (30 NOPs)
+.global wechat_hook_resume   # Exit point (64 NOPs)
 .type wechat_hook, @function
 
 wechat_hook:
@@ -159,14 +159,24 @@ wechat_hook:
 
 wechat_hook_resume:
     #========================================================================
-    # EXIT NOP SLED (30 bytes)
-    # This is second_nop_cmd_addr - init code patches this with:
-    #   [Original 12 bytes from WeChat @ 0x9b0a7a] (12 bytes)
-    #   [movabs rax, wechat_baseaddr + 0x9b0a7a + 12] (10 bytes)
-    #   [jmp rax] (2 bytes)
-    # Total: 24 bytes, with 6 bytes spare
+    # EXIT NOP SLED (64 bytes)
+    # This is second_nop_cmd_addr - init code patches this with relocated
+    # instructions that handle RIP-relative addressing:
+    #
+    # Original code at 0x9b0a7a:
+    #   74 05             je +5 (skip call if equal)
+    #   e8 XX XX XX XX    call rel32
+    #   80 7c 24 10 00    cmpb $0x0, 0x10(%rsp)
+    #
+    # Patched trampoline (31 bytes):
+    #   74 0C             je +12 (skip movabs+call)
+    #   48 B8 [8 bytes]   movabs rax, <absolute call target>
+    #   FF D0             call rax
+    #   80 7C 24 10 00    cmpb $0x0, 0x10(%rsp)
+    #   48 B8 [8 bytes]   movabs rax, <return address>
+    #   FF E0             jmp rax
     #========================================================================
-    .rept 30
+    .rept 64
     nop
     .endr
 
