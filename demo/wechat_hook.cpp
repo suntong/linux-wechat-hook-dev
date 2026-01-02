@@ -185,6 +185,170 @@ void __attribute__((constructor)) wechat_hook_init(void) {
   }
 }
 
+
+/*
+ * Validate pointer is in user space range
+ */
+static inline bool is_valid_user_ptr(uint64_t addr) {
+  return (addr >= 0x10000 && addr < 0x7fffffffffff);
+}
+
+/*
+ * Dump a register value and, if it looks like a user pointer,
+ * the first 16 bytes at that address in hex.
+ */
+static inline void dump_reg_and_mem(const char *name, uint64_t val) {
+  LOGGER_INFO << "  " << name << "  " << LogFormat::addr << val;
+  if (!is_valid_user_ptr(val)) {
+    return;
+  }
+
+  unsigned char *ptr = (unsigned char *)val;
+  char hex_buf[50]; // Max: 16 * 3 = 48 plus a null terminator
+  int pos = 0;
+  for (int i = 0; i < 16; i++) {
+    pos += snprintf(&hex_buf[pos], sizeof(hex_buf) - pos, "%02x ", ptr[i]);
+  }
+  LOGGER_INFO << "    [ " << hex_buf << "]";
+}
+
+/*
+
+# Registers Dump Analysis
+
+## Patterns
+
+rcx
+
+    Essentially always 0x0.
+
+r9
+
+    Almost always 0x0 or 0x7.
+
+r8
+
+    Very often 0x574cb742b010.
+
+    That’s a heap address pointing to what looks like a fixed struct or
+    table (the hex dumps show small integers / flags). You sometimes see
+    small variations, but it’s heavily reused.
+
+    However, sometimes the register value (e.g. 0x574cb7e03) happens to
+    have a value inside that numeric range but not corresponding to a
+    mapped page, so ptr[i] will hit an unmapped region and raises SIGSEGV,
+    which crashed the program with segmentation fault.
+
+r11
+
+    Always (or nearly always) 0x2c5e470132d5e798.
+    which is not a plausible user pointer thus skipped by is_valid_user_ptr
+    looks like a constant/cookie/canary.
+
+rdx, rsp, rbp, r12, r13
+
+    These are mostly stack or nearby addresses around 0x7ffec0..., with patterns like:
+        rdx: [stack_addr, rbp, ...]
+        rsp: pointer to that same frame.
+        r12, r13 sometimes equal to the same stack strings that rdi points to (dates/times).
+
+rbx — Holds the string length of rdi's content:
+
+    "08:33" (5 chars) → rbx = 0x5
+    "2025/12/31" (10 chars) → rbx = 0xa
+    Chinese text 47 bytes → rbx = 0x2f
+
+r10 = rsi + 0x10 consistently! It's metadata (rsi + 0x10), contains counter + security canary
+
+- The rbx = length, rdi = data pattern strongly suggests this is a
+  std::string destructor path, where rbx holds .size() and rdi points to
+  the data buffer.
+- No other register values are with a very small set of patterns.
+- No other registers usually point to text.
+
+## rdi and r12
+
+When what rdi points to is either time like "09:24" or real message,
+correspondingly, r12 points to the *same* content but to *different* places.
+Two different cases:
+
+    Short stack strings (e.g. "08:33", "2025/12/31")
+        rdi == r12
+        The first bytes at r12 are literally the characters of the string.
+        This matches small-string optimization: data is stored inline in the object/stack.
+
+    Long “real” messages (heap-allocated)
+        rdi points to the actual char buffer in heap (UTF-8 text).
+        r12 points to a metadata struct on the stack:
+            First 8 bytes: a small integer like 0x24, 0x60, etc → the string length (36, 96, … bytes).
+            Next 8 bytes: pointer to some other stack object (0x7ffec02283c0), likely the owning std::string frame object or rep object.
+        In this case,
+        - r12 does not point to the text; it points to the descriptor that contains the length and a pointer.
+        - (meanhile, r13 points to a different descriptor but always with same length).
+
+This aligns perfectly with the original code at the hook point
+(std::string destructor):
+
+    9b0a72: mov 0x18(%rsp), %rdi    ; rdi = data pointer (_M_p)
+    9b0a77: cmp %r12, %rdi
+    9b0a7a: je  9b0a81               ; if rdi == r12 → SSO, no heap free
+    9b0a7c: call _ZdlPv@plt          ; else delete(rdi)
+
+- When it’s a short SSO (small-string optimization) string, rdi == r12, so no delete.
+- When it’s a heap string, rdi != r12, and being the metadata block, delete(rdi).
+
+The lmclmc/linux-wechat-hook's code never do heap free so will run out of the heap space eventually.
+
+
+*/
+
+/*
+ * Dump the current stack frame [rsp .. rbp) as hex.
+ * This approximates "all wechat local variables" at the hook point.
+ */
+static inline void dump_stack_frame(struct user_regs_struct *regs) {
+  // dumping [regs->rsp .. regs->rbp) to give the whole wechat stack frame
+  uint64_t rsp = regs->rsp;
+  uint64_t rbp = regs->rbp;
+
+  // Basic sanity
+  if (!is_valid_user_ptr(rsp) || !is_valid_user_ptr(rbp) || rbp <= rsp) {
+    return;
+  }
+
+  uint64_t frame_size = rbp - rsp;
+  uint64_t slots = frame_size / 8;
+
+  LOGGER_INFO << "   --- Stack Frame (WeChat locals) ---";
+  LOGGER_INFO << "   rsp=" << LogFormat::addr << rsp
+              << " rbp=" << LogFormat::addr << rbp
+              << " size=" << frame_size
+              << " bytes (" << slots << " qwords)";
+
+  // Don't spam too much: cap visible dump (e.g. 0x400 bytes)
+  size_t max_bytes = (frame_size > 0x400) ? 0x400 : (size_t)frame_size;
+
+  for (size_t off = 0; off < max_bytes; off += 16) {
+    uint64_t addr = rsp + off;
+    if (!is_valid_user_ptr(addr)) {
+      break;
+    }
+
+    unsigned char *p = (unsigned char *)addr;
+    char hex_buf[16 * 3 + 1];
+    int pos = 0;
+    for (int i = 0; i < 16 && off + i < max_bytes; ++i) {
+      unsigned char b = p[i];
+      pos += snprintf(&hex_buf[pos], sizeof(hex_buf) - pos, "%02x ", b);
+    }
+    hex_buf[pos] = 0;
+
+    // Show offset from rsp so you can correlate slots
+    LOGGER_INFO << "     [rsp+" << LogFormat::addr << off << "] " << hex_buf;
+  }
+}
+
+
 static void wechat_hook_core(struct user_regs_struct *regs)
 {
   // if (regs->r8 > 0x5016f3e7d290 && regs->r8 < 0x7fffffffffff)
@@ -215,9 +379,31 @@ static void wechat_hook_core(struct user_regs_struct *regs)
   // {
   //     LOGGER_INFO << " rsi  " << LogFormat::addr << regs->rsi << "  " << (char *)regs->rsi;
   // }
-  if (regs->rdi > 0x5016f3e7d290 && regs->rdi < 0x7fffffffffff)
-  {
-    LOGGER_INFO << " rdi  " << LogFormat::addr << regs->rdi << "  " << (char *)regs->rdi;
+  if (regs->rdi > 0x5016f3e7d290 && regs->rdi < 0x7fffffffffff) {
+    if ( *((char *)regs->rdi) == '\0' ) return;
+
+    LOGGER_INFO << " Msg(" << LogFormat::addr << regs->r9 << ")  " << (char *)regs->rdi;
+
+    // dump saved registers' values and optionally pointed data
+    // dump_reg_and_mem("rbx", regs->rbx);
+    // dump_reg_and_mem("rcx", regs->rcx);
+    // dump_reg_and_mem("rdx", regs->rdx);
+    // dump_reg_and_mem("rsi", regs->rsi);
+    // dump_reg_and_mem("rdi", regs->rdi);
+    // dump_reg_and_mem("rbp", regs->rbp);
+    // dump_reg_and_mem("rsp", regs->rsp);
+    // dump_reg_and_mem("r8",  regs->r8);
+    // dump_reg_and_mem("r9",  regs->r9);
+    // dump_reg_and_mem("r10", regs->r10);
+    // dump_reg_and_mem("r11", regs->r11);
+    // dump_reg_and_mem("r12", regs->r12);
+    // dump_reg_and_mem("r13", regs->r13);
+    // dump_reg_and_mem("r14", regs->r14);
+    // dump_reg_and_mem("r15", regs->r15);
+
+    // dump the entire wechat stack frame (locals, saved regs, etc.)
+    //dump_stack_frame(regs); // OK, but almost all are heap pointers
+
   }
   // if (regs->rsp > 0x5016f3e7d290 && regs->rsp < 0x7fffffffffff)
   // {
