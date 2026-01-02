@@ -382,7 +382,7 @@ static void wechat_hook_core(struct user_regs_struct *regs)
   if (regs->rdi > 0x5016f3e7d290 && regs->rdi < 0x7fffffffffff) {
     if ( *((char *)regs->rdi) == '\0' ) return;
 
-    LOGGER_INFO << " Msg(" << LogFormat::addr << regs->r9 << ")  " << (char *)regs->rdi;
+    LOGGER_INFO << (char *)regs->rdi;
 
     // dump saved registers' values and optionally pointed data
     // dump_reg_and_mem("rbx", regs->rbx);
