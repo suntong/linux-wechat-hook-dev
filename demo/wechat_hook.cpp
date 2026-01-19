@@ -7,8 +7,30 @@
 #include "target/targetopt.h"
 #include "log/log.h"
 
-#define WECHAT_OFFSET 0x9b0a7a
+//=============================================================================
+// HOOK CONFIGURATION
+//=============================================================================
+// movabs rax, imm64 (10 bytes) + jmp rax (2 bytes) = 12 bytes
+#define JMP_STUB_SIZE 12
 
+// Hook offset into WeChat binary - target instruction address (relative to base)
+// Target location analysis:
+//   71df9f: 41 8b 06                mov (%r14),%eax         ; 3 bytes
+//   71dfa2: c7 44 24 30 06 00 00 00 movl $0x6,0x30(%rsp)    ; 8 bytes
+//   71dfaa: 89 44 24 20             mov %eax,0x20(%rsp)     ; 4 bytes
+// Total: 15 bytes of instructions to relocate
+#define WECHAT_OFFSET 0x71df9f
+
+// Size of original instructions to relocate to trampoline
+// Must be >= 12 (hook size) and end on instruction boundary
+// Hook injection requires: 10 bytes (movabs) + 2 bytes (jmp) = 12 bytes
+// Instruction boundaries: 3, 11 (3+8), 15 (3+8+4),
+// Therefore we must relocate 15 bytes to preserve complete instructions
+#define WECHAT_HOOK_BYTES 15
+
+//=============================================================================
+// HOOK INITIALIZATION - Called when library is loaded via LD_PRELOAD
+//=============================================================================
 void __attribute__((constructor)) wechat_hook_init(void) {
   /*
 
@@ -20,31 +42,53 @@ void __attribute__((constructor)) wechat_hook_init(void) {
         Relocating the instructions to the second NOP sled (trampoline)
         Replacing the original instructions with a jump to the first NOP sled
         The first NOP sled fall-throuh to the hook function
+        After the trampoline code, it then jumps back to wechat to continue its normal operations
 
-  Hock Logic:
+  Execution Flow Diagram:
 
-    At hook point in wechat, flags are set by cmp %r12,%rdi, then it
-    Jump to first_nop_cmd_addr (the first NOP sled in wechat_hook())
-    After the NOP sled, pushfq to save the flags from the cmp
-    Then `mov %rbp,%r14; mov %rdi,%r15;` to save rbp & rdi to r14 r15
-    Call wechat_hook_run(), which has its own prologue that modifies flags
-    After return: popfq to restore the original flags before any compiler-generated code can mess with stack
-    Then is the second NOP sled, which now contains the trampoline code
-    The trampoline code finish the relocated instructions then
-    jumps back to wechat to continue its normal operations
+   WeChat code at 0x71df9f
+         |
+         v (patched to jump)
+    first_nop_cmd_addr (16 NOPs)
+         |
+         v
+    push r14, push r15 (save original values)
+    mov rbp->r14, mov rdi->r15 (for hook analysis)
+         |
+         v
+    wechat_hook_run() -> wechat_hook_core()
+         |
+         v
+    pop r15, pop r14 (restore original values)
+         |
+         v
+    second_nop_cmd_addr (TRAMPOLINE):
+      - Execute: mov (%r14),%eax      (uses correct r14!)
+      - Execute: movl $0x6,0x30(%rsp)
+      - Execute: mov %eax,0x20(%rsp)
+      - Jump back to 0x71df9f + 15 = 0x71dfae
+         |
+         v
+    Continue WeChat execution at 0x71dfae
 
    */
   
   printf("Dynamic library loaded: Running initialization.\n");
   lmc::Logger::setLevel(LogLevel::all);
+
+  // Read process memory maps to find base addresses
   TargetMaps target(getpid());
-  Elf64_Addr wechat_baseaddr = 0;
-  Elf64_Addr libx_baseaddr = 0;
-  Elf64_Addr first_nop_cmd_addr = 0;
-  Elf64_Addr second_nop_cmd_addr = 0;
+  Elf64_Addr wechat_baseaddr = 0;      // Base address of WeChat executable
+  Elf64_Addr libx_baseaddr = 0;         // Base address of our hook library (libX.so)
+  Elf64_Addr first_nop_cmd_addr = 0;    // Entry point NOP sled (hook entry)
+  Elf64_Addr second_nop_cmd_addr = 0;   // Trampoline NOP sled (displaced code + return)
+
   if (target.readTargetAllMaps())
   {
     auto &maps = target.getMapInfo();
+    //---------------------------------------------------------------------
+    // Step 1: Find base addresses of WeChat and our hook library
+    //---------------------------------------------------------------------
     for (auto &m : maps)
     {
       if (m.first.find("wechat") != std::string::npos)
@@ -60,28 +104,39 @@ void __attribute__((constructor)) wechat_hook_init(void) {
       } 
     }
 
+    //---------------------------------------------------------------------
+    // Step 2: Search for two 16-byte NOP sleds in our hook library
+    // - First NOP sled: Hook entry point (wechat_hook function start)
+    // - Second NOP sled: Trampoline (holds displaced instructions + jump back)
+    //---------------------------------------------------------------------
     unsigned char buffer[16] = {0x90};
     memset(buffer, 0x90, sizeof(buffer));
 
     unsigned char *nop_cmd_byte = (unsigned char *)libx_baseaddr;
     for (int i = 0; i < 0x1000000; i++)
     {
+      // Check for 16 consecutive NOP bytes
       if (!memcmp(&nop_cmd_byte[i], buffer, sizeof(buffer)))
       {
         if (first_nop_cmd_addr)
         {
+          // Found second NOP sled - this will be our trampoline
           second_nop_cmd_addr = (Elf64_Addr)&nop_cmd_byte[i];
           LOGGER_INFO << "second search successful   " << LogFormat::addr << second_nop_cmd_addr;
           break;
         } else {
+          // Found first NOP sled - this is where WeChat will jump to
           first_nop_cmd_addr = (Elf64_Addr)&nop_cmd_byte[i];
           LOGGER_INFO << "first search successful   " << LogFormat::addr << first_nop_cmd_addr;
-          i += 16;
+          i += 16;  // Skip past this sled to find the next one
           continue;
         }
       }
     }
 
+    //---------------------------------------------------------------------
+    // Step 3: Make memory regions writable for patching
+    //---------------------------------------------------------------------
     if (mprotect((void *)(wechat_baseaddr), 0x1000000, PROT_WRITE | PROT_READ | PROT_EXEC) < 0)
     {
       LOGGER_INFO << "mprotect wechat (RWX) failed";
@@ -91,88 +146,78 @@ void __attribute__((constructor)) wechat_hook_init(void) {
     {
       LOGGER_INFO << "mprotect libx (RWX) failed";
     }
-        
-    // --- FIXED TRAMPOLINE: relocate je/call/cmpb correctly ---
-    //
-    // Original at WECHAT_OFFSET:
-    //   9b0a7a: 74 05                   je     9b0a81
-    //   9b0a7c: e8 3f e1 a4 ff          call   3febc0 <_ZdlPv@plt>
-    //   9b0a81: 80 7c 24 10 00          cmpb   $0x0,0x10(%rsp)
-    //
-    // We build at second_nop_cmd_addr:
-    //   jz  +0x0c                      ; skip movabs+call if ZF=1
-    //   movabs rax, call_target
-    //   call  rax
-    //   cmpb  $0x0,0x10(%rsp)
-    //   movabs rax, resume
-    //   jmp   rax
-    //
-    // NOTE: call is absolute (mov rax; call rax) to avoid rel32 range issues
-    // when calling from libX.so to wechat.
 
-    unsigned char *orig = (unsigned char *)wechat_baseaddr + WECHAT_OFFSET;
-    unsigned char *tramp = (unsigned char *)second_nop_cmd_addr;
+    //---------------------------------------------------------------------
+    // Step 4: Build the TRAMPOLINE at second_nop_cmd_addr
+    // Layout:
+    //   [0-14]  : Displaced original instructions (15 bytes)
+    //   [15-24] : movabs $return_addr, %rax (10 bytes)
+    //   [25-26] : jmp *%rax (2 bytes)
+    //---------------------------------------------------------------------
 
-    unsigned char tramp_inst[32];
-    memset(tramp_inst, 0x90, sizeof(tramp_inst));
-    int t_idx = 0;
+    // Copy 15 bytes of original instructions to trampoline
+    memcpy((unsigned char *)second_nop_cmd_addr,
+           (unsigned char *)wechat_baseaddr + WECHAT_OFFSET,
+           WECHAT_HOOK_BYTES);
 
-    // 1) JZ +0x0c  (skip over movabs+call)
-    tramp_inst[t_idx++] = 0x74;  // JZ rel8
-    tramp_inst[t_idx++] = 0x0c;  // +12 bytes
-
-    // 2) Compute absolute call_target from original rel32
-    int orig_disp = 0;
-    memcpy(&orig_disp, orig + 3, 4);  // original disp32 at orig+3
-    Elf64_Addr orig_call_after = (Elf64_Addr)(orig + 2 + 5);
-    Elf64_Addr call_target = orig_call_after + (int64_t)orig_disp;
-
-    // 3) movabs rax, call_target
-    tramp_inst[t_idx++] = 0x48;
-    tramp_inst[t_idx++] = 0xb8;
-    memcpy(&tramp_inst[t_idx], &call_target, 8);
-    t_idx += 8;
-
-    // 4) call rax
-    tramp_inst[t_idx++] = 0xff;
-    tramp_inst[t_idx++] = 0xd0;
-
-    // 5) cmpb $0x0,0x10(%rsp)  (copy from orig+7, position-independent)
-    memcpy(&tramp_inst[t_idx], orig + 7, 5);
-    t_idx += 5;
-
-    // Write relocated instructions to second_nop_cmd_addr
-    memcpy(tramp, tramp_inst, t_idx);
-
-    // After these t_idx bytes, keep your original movabs/jmp back.
-
+    // Build: movabs $return_address, %rax
+    // Machine code: 48 b8 <8-byte immediate>
+    // Return address is right after the relocated instructions in WeChat
     unsigned char movabs_wechat_buffer[10];
     memset(movabs_wechat_buffer, 0, sizeof(movabs_wechat_buffer));
-    Elf64_Addr wechat_hook_point_addr = (Elf64_Addr)wechat_baseaddr + WECHAT_OFFSET + 12;
-    movabs_wechat_buffer[0] = 0x48;
-    movabs_wechat_buffer[1] = 0xb8;
+    Elf64_Addr wechat_hook_point_addr = (Elf64_Addr)wechat_baseaddr + WECHAT_OFFSET + WECHAT_HOOK_BYTES;
+    movabs_wechat_buffer[0] = 0x48;  // REX.W prefix
+    movabs_wechat_buffer[1] = 0xb8;  // MOV imm64 to RAX
     memcpy(&movabs_wechat_buffer[2], &wechat_hook_point_addr, 8);
+    memcpy((unsigned char *)second_nop_cmd_addr + WECHAT_HOOK_BYTES, movabs_wechat_buffer, 10);
 
-    memcpy((unsigned char *)second_nop_cmd_addr + t_idx, movabs_wechat_buffer, 10);
-
+    // Build: jmp *%rax
+    // Machine code: ff e0
     unsigned char jmp_wechat_buffer[2];
     jmp_wechat_buffer[0] = 0xff;
     jmp_wechat_buffer[1] = 0xe0;
-    memcpy((unsigned char *)second_nop_cmd_addr + t_idx + 10, jmp_wechat_buffer, 2);
+    memcpy((unsigned char *)second_nop_cmd_addr + WECHAT_HOOK_BYTES + 10, jmp_wechat_buffer, 2);
 
-    // --- HOOK INSTALLATION ---
+    //---------------------------------------------------------------------
+    // Step 5: Patch the HOOK POINT in WeChat
+    // Replace original instructions with jump to our hook entry
+    //
+    //   movabs rax, first_nop_cmd_addr
+    //   jmp    rax
+    //   [optional NOP padding for the remainder of WECHAT_HOOK_BYTES]
+
+    // This completely replaces the first WECHAT_HOOK_BYTES bytes at
+    // WECHAT_OFFSET. Any extra bytes beyond the 12-byte jump stub are
+    // filled with NOP so we never execute a partially decoded instruction.
+    //---------------------------------------------------------------------
+
+    // Build: movabs $first_nop_cmd_addr, %rax
     unsigned char movabs_buffer[10];
     memset(movabs_buffer, 0, sizeof(movabs_buffer));
-    movabs_buffer[0] = 0x48;
-    movabs_buffer[1] = 0xb8;
+    movabs_buffer[0] = 0x48;  // REX.W prefix
+    movabs_buffer[1] = 0xb8;  // MOV imm64 to RAX
     memcpy(&movabs_buffer[2], &first_nop_cmd_addr, 8);
     memcpy((unsigned char *)wechat_baseaddr + WECHAT_OFFSET, movabs_buffer, 10);
   
+    // Build: jmp *%rax
     unsigned char jmp_buffer[2];
     jmp_buffer[0] = 0xff;
     jmp_buffer[1] = 0xe0;
     memcpy((unsigned char *)wechat_baseaddr + WECHAT_OFFSET + 10, jmp_buffer, 2);
 
+    // Pad any remaining bytes (if WECHAT_HOOK_BYTES > 12) with NOPs so that
+    // the whole overwritten region is clean and we don't leave remnants of
+    // a partially executed instruction.
+    if (WECHAT_HOOK_BYTES > JMP_STUB_SIZE) {
+      memset((unsigned char *)wechat_baseaddr + WECHAT_OFFSET
+             + JMP_STUB_SIZE,
+             0x90,  // NOP
+             WECHAT_HOOK_BYTES - JMP_STUB_SIZE);
+    }
+
+    //---------------------------------------------------------------------
+    // Step 6: Restore original memory protections
+    //---------------------------------------------------------------------
     if (mprotect((void *)(wechat_baseaddr), 0x1000000, PROT_READ | PROT_EXEC) < 0)
     {
       LOGGER_INFO << "mprotect wechat (RX) failed";
@@ -349,6 +394,9 @@ static inline void dump_stack_frame(struct user_regs_struct *regs) {
 }
 
 
+//=============================================================================
+// HOOK CORE - Processes captured register state
+//=============================================================================
 static void wechat_hook_core(struct user_regs_struct *regs)
 {
   // if (regs->r8 > 0x5016f3e7d290 && regs->r8 < 0x7fffffffffff)
@@ -379,6 +427,7 @@ static void wechat_hook_core(struct user_regs_struct *regs)
   // {
   //     LOGGER_INFO << " rsi  " << LogFormat::addr << regs->rsi << "  " << (char *)regs->rsi;
   // }
+  LOGGER_INFO << "Hook core reached.";
   if (regs->rdi > 0x5016f3e7d290 && regs->rdi < 0x7fffffffffff) {
     if ( *((char *)regs->rdi) == '\0' ) return;
 
@@ -415,17 +464,23 @@ static void wechat_hook_core(struct user_regs_struct *regs)
   // }
 }
 
+//=============================================================================
+// HOOK RUN - Captures and restores register state around hook core
+//=============================================================================
 static void wechat_hook_run()
 {
   struct user_regs_struct regs = {0};
 
+  // Capture current register state
+  // Note: r14/r15 slots receive values saved there by wechat_hook()
+  //       which are rbp and rdi respectively (for hook analysis)
   asm volatile (
     "mov %%rbx, %0\n"
     "mov %%rcx, %1\n"
     "mov %%rdx, %2\n"
     "mov %%rsi, %3\n"
-    "mov %%r15, %4\n"
-    "mov %%r14, %5\n"
+    "mov %%r15, %4\n"   // r15 contains rdi (saved in wechat_hook)
+    "mov %%r14, %5\n"   // r14 contains rbp (saved in wechat_hook)
     "mov %%rsp, %6\n"
     "mov %%r8, %7\n"
     "mov %%r9, %8\n"
@@ -443,8 +498,10 @@ static void wechat_hook_run()
     : "memory"
     );
 
+  // Call the hook core with captured registers
   wechat_hook_core(&regs);
 
+  // Restore register state (except r14/r15 which are handled by wechat_hook)
   asm volatile (
     "mov %0, %%rbx\n"
     "mov %1, %%rcx\n"
@@ -470,9 +527,16 @@ static void wechat_hook_run()
     );
 }
 
+//=============================================================================
+// HOOK FUNCTION - Contains NOP sleds that get patched at runtime
+//=============================================================================
 void wechat_hook()
 {
   // first_nop_cmd_addr
+  //-------------------------------------------------------------------------
+  // FIRST NOP SLED (16 bytes) - Hook entry point
+  // WeChat's patched code jumps here (to first_nop_cmd_addr)
+  //-------------------------------------------------------------------------
   asm("nop;\n"
       "nop;\n"
       "nop;\n"
@@ -489,17 +553,45 @@ void wechat_hook()
       "nop;\n"
       "nop;\n"
       "nop;\n"
+      //---------------------------------------------------------------------
+      // CRITICAL: Save r14 and r15 before modifying them!
+      // At hook point 0x71df9f:
+      //   - r14 contains original rdx (saved at 71df8b: mov %rdx,%r14)
+      //   - r15 contains original rsi (saved at 71df8e: mov %rsi,%r15)
+      // The displaced instruction "mov (%r14),%eax" needs r14 intact!
+      //---------------------------------------------------------------------
+      "push %r14;\n"
+      "push %r15;\n"
+      // Prepare values for hook_core analysis
+      // rbp -> r14 (will be read as regs.rbp in hook_core)
+      // rdi -> r15 (will be read as regs.rdi in hook_core)
       "mov %rbp,%r14;\n"
       "mov %rdi,%r15;\n"
       "pushfq;\n"        // save flags from cmp %r12,%rdi
       "sub $8, %rsp;\n"  // keep stack 16-byte aligned for call (if desired)
     );
    
+  // Execute hook logic
   wechat_hook_run();
 
   asm("add $8, %rsp;\n"  // undo alignment adjustment (if used)
-      // second_nop_cmd_addr
       "popfq;\n"         // restore flags before executing relocated je/call/cmpb
+      //-------------------------------------------------------------------------
+      // Restore r14/r15 to their original values before trampoline executes
+      // This is essential because the displaced instruction "mov (%r14),%eax"
+      // must read from the correct memory location
+      //-------------------------------------------------------------------------
+      "pop %r15;\n"
+      "pop %r14;\n"
+
+      // second_nop_cmd_addr
+      //---------------------------------------------------------------------
+      // SECOND NOP SLED (30 bytes) - Trampoline location
+      // At runtime, this gets patched with:
+      //   [0-14]  : Original instructions (15 bytes)
+      //   [15-24] : movabs $return_addr, %rax
+      //   [25-26] : jmp *%rax
+      //---------------------------------------------------------------------
       "nop;\n"
       "nop;\n"
       "nop;\n"
