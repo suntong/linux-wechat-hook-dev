@@ -1,8 +1,13 @@
 #include <iostream>
 #include <unistd.h>
 #include <string.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <cctype>
+
 #include <sys/user.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 
 #include "target/targetopt.h"
 #include "log/log.h"
@@ -35,7 +40,7 @@ void __attribute__((constructor)) wechat_hook_init(void) {
   /*
 
   Init Actions:
-  
+
     Find the base address of the wechat binary and libX.so
     Find 2nd NOP sleds (32 consecutive 0x90 bytes) in libX.so to use as trampoline
     Hook the instruction at WECHAT_OFFSET (0x9b0a7a) by:
@@ -72,7 +77,7 @@ void __attribute__((constructor)) wechat_hook_init(void) {
     Continue WeChat execution at 0x71dfae
 
    */
-  
+
   printf("Dynamic library loaded: Running initialization.\n");
   lmc::Logger::setLevel(LogLevel::all);
 
@@ -101,7 +106,7 @@ void __attribute__((constructor)) wechat_hook_init(void) {
       {
         libx_baseaddr = m.second;
         LOGGER_INFO << m.first << " :: " << LogFormat::addr << m.second;
-      } 
+      }
     }
 
     //---------------------------------------------------------------------
@@ -198,7 +203,7 @@ void __attribute__((constructor)) wechat_hook_init(void) {
     movabs_buffer[1] = 0xb8;  // MOV imm64 to RAX
     memcpy(&movabs_buffer[2], &first_nop_cmd_addr, 8);
     memcpy((unsigned char *)wechat_baseaddr + WECHAT_OFFSET, movabs_buffer, 10);
-  
+
     // Build: jmp *%rax
     unsigned char jmp_buffer[2];
     jmp_buffer[0] = 0xff;
@@ -239,113 +244,139 @@ static inline bool is_valid_user_ptr(uint64_t addr) {
 }
 
 /*
+ * Try to safely read memory. Returns true if readable.
+ */
+static inline bool safe_memread(const void *addr, void *buf, size_t len) {
+    // Use process_vm_readv so the kernel validates accessibility and copies for us.
+    // This avoids SIGSEGV from direct user-space dereferences.
+    struct iovec local_iov;
+    struct iovec remote_iov;
+
+    local_iov.iov_base = buf;
+    local_iov.iov_len  = len;
+
+    remote_iov.iov_base = const_cast<void *>(addr);
+    remote_iov.iov_len  = len;
+
+    ssize_t n = process_vm_readv(getpid(), &local_iov, 1, &remote_iov, 1, 0);
+    return (n == (ssize_t)len);
+}
+
+template <typename T>
+static inline bool safe_read_value(uint64_t addr, T *out) {
+  return safe_memread((const void *)addr, out, sizeof(T));
+}
+
+/*
  * Dump a register value and, if it looks like a user pointer,
  * the first 16 bytes at that address in hex.
  */
 static inline void dump_reg_and_mem(const char *name, uint64_t val) {
   LOGGER_INFO << "  " << name << "  " << LogFormat::addr << val;
+
+  // Sanity check
   if (!is_valid_user_ptr(val)) {
     return;
   }
+  unsigned char buf[16];
+  if (!safe_memread((const void *)val, buf, sizeof(buf))) {
+    LOGGER_INFO << "    [ <inaccessible> ]";
+    return;
+  }
 
-  unsigned char *ptr = (unsigned char *)val;
+  // NOTE: Use 'buf' here (NOT direct pointer dereference), otherwise we may SIGSEGV.
   char hex_buf[50]; // Max: 16 * 3 = 48 plus a null terminator
   int pos = 0;
   for (int i = 0; i < 16; i++) {
-    pos += snprintf(&hex_buf[pos], sizeof(hex_buf) - pos, "%02x ", ptr[i]);
+    pos += snprintf(&hex_buf[pos], sizeof(hex_buf) - pos, "%02x ", buf[i]);
   }
   LOGGER_INFO << "    [ " << hex_buf << "]";
+
+  // Additional probing: if it looks like a string, print it
+  // NOTE: Do not directly dereference 'val' as a char*; read safely instead.
+  if (buf[0] != 0 && isprint((unsigned char)buf[0])) {
+    char str_buf[256];
+    if (safe_memread((const void *)val, str_buf, sizeof(str_buf) - 1)) {
+      str_buf[sizeof(str_buf) - 1] = '\0';
+      LOGGER_INFO << "    (as string: \"" << str_buf << "\")";
+    }
+  }
 }
 
 /*
+ * Dump a presumed message struct pointed to by base_addr.
+ * Based on inferred offsets from asm analysis.
+ */
+static inline void dump_message_struct(uint64_t base_addr) {
+  if (!is_valid_user_ptr(base_addr)) {
+    return;
+  }
 
-# Registers Dump Analysis
+  LOGGER_INFO << "   --- Message Struct at " << LogFormat::addr << base_addr << " ---";
 
-## Patterns
+  // Content string (0x58: ptr, 0x60: len?, 0x68: null-term)
+  uint64_t content_ptr = 0;
+  if (safe_read_value<uint64_t>(base_addr + 0x58, &content_ptr)) {
+    dump_reg_and_mem("Content (0x58)", content_ptr);
+  } else {
+    LOGGER_INFO << "  Content <inaccessible>";
+    return;
+  }
 
-rcx
+  // Sender string (0x78: ptr, 0x80: len?, 0x88: null-term)
+  uint64_t sender_ptr = 0;
+  if (safe_read_value<uint64_t>(base_addr + 0x78, &sender_ptr)) {
+    dump_reg_and_mem("Sender (0x78)", sender_ptr);
+  }
 
-    Essentially always 0x0.
+  // Chat/ID string (0x98: ptr, 0xa0: len?, 0xa8: null-term)
+  uint64_t chat_ptr = 0;
+  if (safe_read_value<uint64_t>(base_addr + 0x98, &chat_ptr)) {
+    dump_reg_and_mem("Chat/ID (0x98)", chat_ptr);
+  }
 
-r9
+  // Type (0xb8: int32)
+  uint32_t type = 0;
+  if (safe_read_value<uint32_t>(base_addr + 0xb8, &type)) {
+    LOGGER_INFO << "  Type (0xb8): " << type;
+  }
 
-    Almost always 0x0 or 0x7.
+  // Attachments array/vector (0xc0: xmm/zeroed, but assume ptr + size)
+  uint64_t attach_ptr = 0;
+  if (safe_read_value<uint64_t>(base_addr + 0xc0, &attach_ptr)) {
+    dump_reg_and_mem("Attachments (0xc0)", attach_ptr);
+  }
 
-r8
+  // Metadata ptr (0xd0)
+  uint64_t meta_ptr = 0;
+  if (safe_read_value<uint64_t>(base_addr + 0xd0, &meta_ptr)) {
+    dump_reg_and_mem("Metadata (0xd0)", meta_ptr);
+  }
 
-    Very often 0x574cb742b010.
+  // Extended ptr (0xd8)
+  uint64_t ext_ptr = 0;
+  if (safe_read_value<uint64_t>(base_addr + 0xd8, &ext_ptr)) {
+    dump_reg_and_mem("Extended (0xd8)", ext_ptr);
+  }
 
-    That’s a heap address pointing to what looks like a fixed struct or
-    table (the hex dumps show small integers / flags). You sometimes see
-    small variations, but it’s heavily reused.
+  // Timestamp/Secondary ID (0xe0: int32)
+  uint32_t timestamp = 0;
+  if (safe_read_value<uint32_t>(base_addr + 0xe0, &timestamp)) {
+    LOGGER_INFO << "  Timestamp/ID (0xe0): " << timestamp;
+  }
 
-    However, sometimes the register value (e.g. 0x574cb7e03) happens to
-    have a value inside that numeric range but not corresponding to a
-    mapped page, so ptr[i] will hit an unmapped region and raises SIGSEGV,
-    which crashed the program with segmentation fault.
+  // Status flag (0xe4: byte)
+  uint8_t status = 0;
+  if (safe_read_value<uint8_t>(base_addr + 0xe4, &status)) {
+    LOGGER_INFO << "  Status (0xe4): " << (int)status;
+  }
 
-r11
-
-    Always (or nearly always) 0x2c5e470132d5e798.
-    which is not a plausible user pointer thus skipped by is_valid_user_ptr
-    looks like a constant/cookie/canary.
-
-rdx, rsp, rbp, r12, r13
-
-    These are mostly stack or nearby addresses around 0x7ffec0..., with patterns like:
-        rdx: [stack_addr, rbp, ...]
-        rsp: pointer to that same frame.
-        r12, r13 sometimes equal to the same stack strings that rdi points to (dates/times).
-
-rbx — Holds the string length of rdi's content:
-
-    "08:33" (5 chars) → rbx = 0x5
-    "2025/12/31" (10 chars) → rbx = 0xa
-    Chinese text 47 bytes → rbx = 0x2f
-
-r10 = rsi + 0x10 consistently! It's metadata (rsi + 0x10), contains counter + security canary
-
-- The rbx = length, rdi = data pattern strongly suggests this is a
-  std::string destructor path, where rbx holds .size() and rdi points to
-  the data buffer.
-- No other register values are with a very small set of patterns.
-- No other registers usually point to text.
-
-## rdi and r12
-
-When what rdi points to is either time like "09:24" or real message,
-correspondingly, r12 points to the *same* content but to *different* places.
-Two different cases:
-
-    Short stack strings (e.g. "08:33", "2025/12/31")
-        rdi == r12
-        The first bytes at r12 are literally the characters of the string.
-        This matches small-string optimization: data is stored inline in the object/stack.
-
-    Long “real” messages (heap-allocated)
-        rdi points to the actual char buffer in heap (UTF-8 text).
-        r12 points to a metadata struct on the stack:
-            First 8 bytes: a small integer like 0x24, 0x60, etc → the string length (36, 96, … bytes).
-            Next 8 bytes: pointer to some other stack object (0x7ffec02283c0), likely the owning std::string frame object or rep object.
-        In this case,
-        - r12 does not point to the text; it points to the descriptor that contains the length and a pointer.
-        - (meanhile, r13 points to a different descriptor but always with same length).
-
-This aligns perfectly with the original code at the hook point
-(std::string destructor):
-
-    9b0a72: mov 0x18(%rsp), %rdi    ; rdi = data pointer (_M_p)
-    9b0a77: cmp %r12, %rdi
-    9b0a7a: je  9b0a81               ; if rdi == r12 → SSO, no heap free
-    9b0a7c: call _ZdlPv@plt          ; else delete(rdi)
-
-- When it’s a short SSO (small-string optimization) string, rdi == r12, so no delete.
-- When it’s a heap string, rdi != r12, and being the metadata block, delete(rdi).
-
-The lmclmc/linux-wechat-hook's code never do heap free so will run out of the heap space eventually.
-
-
-*/
+  // Reply/Chain ptr (0xe8)
+  uint64_t reply_ptr = 0;
+  if (safe_read_value<uint64_t>(base_addr + 0xe8, &reply_ptr)) {
+    dump_reg_and_mem("Reply/Chain (0xe8)", reply_ptr);
+  }
+}
 
 /*
  * Dump the current stack frame [rsp .. rbp) as hex.
@@ -379,12 +410,18 @@ static inline void dump_stack_frame(struct user_regs_struct *regs) {
       break;
     }
 
-    unsigned char *p = (unsigned char *)addr;
+    // NOTE: do not directly dereference (unsigned char*)addr; read safely instead.
+    unsigned char line[16];
+    size_t want = (max_bytes - off >= 16) ? 16 : (max_bytes - off);
+    if (!safe_memread((const void *)addr, line, want)) {
+      LOGGER_INFO << "     [rsp+" << LogFormat::addr << off << "] <inaccessible>";
+      break;
+    }
+
     char hex_buf[16 * 3 + 1];
     int pos = 0;
-    for (int i = 0; i < 16 && off + i < max_bytes; ++i) {
-      unsigned char b = p[i];
-      pos += snprintf(&hex_buf[pos], sizeof(hex_buf) - pos, "%02x ", b);
+    for (size_t i = 0; i < want; ++i) {
+      pos += snprintf(&hex_buf[pos], sizeof(hex_buf) - pos, "%02x ", line[i]);
     }
     hex_buf[pos] = 0;
 
@@ -428,30 +465,37 @@ static void wechat_hook_core(struct user_regs_struct *regs)
   //     LOGGER_INFO << " rsi  " << LogFormat::addr << regs->rsi << "  " << (char *)regs->rsi;
   // }
   LOGGER_INFO << "Hook core reached.";
-  if (regs->rdi > 0x5016f3e7d290 && regs->rdi < 0x7fffffffffff) {
-    if ( *((char *)regs->rdi) == '\0' ) return;
+  if (1) { // (regs->rdi > 0x5016f3e7d290 && regs->rdi < 0x7fffffffffff) {
+    // if ( *((char *)regs->rdi) == '\0' ) return;
 
-    LOGGER_INFO << (char *)regs->rdi;
+    // LOGGER_INFO << (char *)regs->rdi;
 
     // dump saved registers' values and optionally pointed data
-    // dump_reg_and_mem("rbx", regs->rbx);
-    // dump_reg_and_mem("rcx", regs->rcx);
-    // dump_reg_and_mem("rdx", regs->rdx);
-    // dump_reg_and_mem("rsi", regs->rsi);
-    // dump_reg_and_mem("rdi", regs->rdi);
-    // dump_reg_and_mem("rbp", regs->rbp);
-    // dump_reg_and_mem("rsp", regs->rsp);
-    // dump_reg_and_mem("r8",  regs->r8);
-    // dump_reg_and_mem("r9",  regs->r9);
-    // dump_reg_and_mem("r10", regs->r10);
-    // dump_reg_and_mem("r11", regs->r11);
-    // dump_reg_and_mem("r12", regs->r12);
-    // dump_reg_and_mem("r13", regs->r13);
-    // dump_reg_and_mem("r14", regs->r14);
-    // dump_reg_and_mem("r15", regs->r15);
+    dump_reg_and_mem("rbx", regs->rbx);
+    dump_reg_and_mem("rcx", regs->rcx);
+    dump_reg_and_mem("rdx", regs->rdx);
+    dump_reg_and_mem("rsi", regs->rsi);
+    dump_reg_and_mem("rdi", regs->rdi);
+    dump_reg_and_mem("r8",  regs->r8);
+    dump_reg_and_mem("r9",  regs->r9);
+    dump_reg_and_mem("r10", regs->r10);
+    dump_reg_and_mem("r11", regs->r11);
+    dump_reg_and_mem("r12", regs->r12);
+    dump_reg_and_mem("r13", regs->r13);
+    dump_reg_and_mem("r15", regs->r15);
+
+    dump_reg_and_mem("rbp", regs->rbp);
+    dump_reg_and_mem("r14 (org rbp)", regs->r14);
+    dump_reg_and_mem("rsp", regs->rsp);
 
     // dump the entire wechat stack frame (locals, saved regs, etc.)
-    //dump_stack_frame(regs); // OK, but almost all are heap pointers
+    dump_stack_frame(regs); // OK, but almost all are heap pointers
+
+    // Dump inferred message struct (using r14 as base pointer)
+    dump_message_struct(regs->r14);
+
+    // Also try rsp as alternative struct base (if applicable)
+    dump_message_struct(regs->rsp);
 
   }
   // if (regs->rsp > 0x5016f3e7d290 && regs->rsp < 0x7fffffffffff)
@@ -518,7 +562,7 @@ static void wechat_hook_run()
     "mov %12, %%r15\n"
     :
     : "m"(regs.rbx), "m"(regs.rcx), "m"(regs.rdx),
-      "m"(regs.rsi), "m"(regs.rdi), "m"(regs.r8), 
+      "m"(regs.rsi), "m"(regs.rdi), "m"(regs.r8),
       "m"(regs.r9), "m"(regs.r10), "m"(regs.r11),
       "m"(regs.r12), "m"(regs.r13), "m"(regs.r14), "m"(regs.r15)
     : "memory", "cc",
@@ -570,7 +614,7 @@ void wechat_hook()
       "pushfq;\n"        // save flags from cmp %r12,%rdi
       "sub $8, %rsp;\n"  // keep stack 16-byte aligned for call (if desired)
     );
-   
+
   // Execute hook logic
   wechat_hook_run();
 
@@ -624,3 +668,4 @@ void wechat_hook()
       "nop;\n"
     );
 }
+
